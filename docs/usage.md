@@ -51,6 +51,26 @@ The script writes to `dist/<target>/` in the **current working directory**, not 
 
 `dist/` is gitignored. The Docker image tag is `<target>-static-builder`. The build context is `targets/<target>/`.
 
+### Build provenance
+
+Each build pulls the selected Alpine tag, resolves its registry digest, and
+pins that digest for the Docker build. This refreshes the base image without
+turning off the layer cache; `--clean` still forces `--no-cache`.
+
+The output directory also contains:
+
+- `BUILD-INFO.txt`: build time, target/version, Git revision (if available),
+  base-image tag, digest and platform, and cache mode.
+- `APK-PACKAGES.txt`: Alpine packages actually installed in the builder image.
+- `SHA256SUMS`: hashes of the declared binary artifacts. Verify with
+  `cd dist/<target> && sha256sum -c SHA256SUMS`.
+
+Note: pinning the Alpine base image **does not pin `apk` repositories**;
+packages downloaded during the build can still change. These records support
+traceability but do not guarantee a reproducible build or absence of CVEs.
+A failed rebuild clears the earlier metadata, but does not remove earlier
+binaries from the output directory.
+
 ## Checks after the build
 
 A successful build writes `VERSION`, then runs that target's artifact checks. The checks compare the version the binary reports with the version file.

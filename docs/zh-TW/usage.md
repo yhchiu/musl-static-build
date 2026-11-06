@@ -51,6 +51,24 @@ PHP 的 `x.y` 會在編譯前解析。腳本在 Alpine 容器裡用 `wget` 讀�
 
 `dist/` 已列入 gitignore。Docker 映像標籤是 `<target>-static-builder`。建置內容（build context）是 `targets/<target>/`。
 
+### 編譯來源紀錄（Build Provenance）
+
+每次編譯會先拉取指定的 Alpine Tag，解析 Registry Digest，並將該 Digest
+固定用於 Docker Build。預設保留 Docker Layer Cache；`--clean` 仍會加上
+`--no-cache` 強制重建。
+
+輸出目錄另外產生：
+
+- `BUILD-INFO.txt`：編譯時間、目標／版本、Git Commit（若可取得）、
+  Base Image Tag／Digest／平台以及快取模式。
+- `APK-PACKAGES.txt`：Builder Image 實際安裝的 APK 套件及版本。
+- `SHA256SUMS`：宣告匯出的執行檔 SHA-256 雜湊，可使用
+  `cd dist/<target> && sha256sum -c SHA256SUMS` 驗證。
+
+注意：固定 Alpine Base Image **不代表固定 `apk` 套件庫**；編譯時下載的
+套件版本仍可能改變。這些紀錄有助於追溯，但不保證可重現編譯或完全沒有 CVE。
+重編失敗會清除舊 metadata，但不會移除輸出目錄先前的執行檔。
+
 ## 編譯之後的檢查
 
 編譯成功會先寫入 `VERSION`，再執行該目標的產物檢查。檢查會把執行檔回報的版本和這個檔案比對。

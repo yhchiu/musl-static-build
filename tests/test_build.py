@@ -21,12 +21,20 @@ with open(os.environ['DOCKER_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\n')
 if args[0] == os.environ.get('DOCKER_FAIL'):
     sys.exit(42)
-if args[0] == 'run':
+if args[:2] == ['image', 'inspect']:
+    if 'RepoDigests' in args[3]:
+        print(os.environ.get('IMAGE_REF', 'alpine@sha256:' + 'a' * 64))
+    else:
+        print(os.environ.get('IMAGE_PLATFORM', 'linux/amd64'))
+elif args[0] == 'run':
     print(os.environ.get('RELEASE_JSON', '{"version":"8.5.11"}'))
 elif args[0] == 'create':
     print('test-container')
 elif args[0] == 'cp':
-    Path(args[2]).write_text('mock binary\n')
+    if args[1].endswith('/APK-PACKAGES.txt'):
+        Path(args[2]).write_text('musl-1.2.5-r0\nopenssl-3.3.0-r0\n')
+    else:
+        Path(args[2]).write_text('mock binary\n')
 '''
 
 MOCK_PYTHON = r'''#!/usr/bin/python3
@@ -85,12 +93,18 @@ class BuildTests(unittest.TestCase):
         self.calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         return result
 
+    def artifact_copies(self):
+        return [call for call in self.calls if call[0] == 'cp'
+                and not call[1].endswith('/APK-PACKAGES.txt')]
+
     def assert_build(self, target, version, alpine='3.20', clean=False, runtime=True):
         builds = [call for call in self.calls if call[0] == 'build']
         self.assertEqual(len(builds), 1)
         build = builds[0]
         self.assertIn(f'VERSION={version}', build)
-        self.assertIn(f'ALPINE_VERSION={alpine}', build)
+        self.assertIn(f'ALPINE_VERSION={alpine}@sha256:' + 'a' * 64, build)
+        self.assertEqual(build[build.index('--platform') + 1], 'linux/amd64')
+        self.assertIn(['pull', f'alpine:{alpine}'], self.calls)
         self.assertEqual('--no-cache' in build, clean)
         self.assertEqual(build[-1], str(self.project / 'targets' / target))
         self.assertEqual(build[build.index('-t') + 1], f'{target}-static-builder')
@@ -98,6 +112,19 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(build[build.index('-f') + 1], str(output / 'Dockerfile'))
         self.assertIn(['rm', 'test-container'], self.calls)
         self.assertEqual((output / 'VERSION').read_text(), version + '\n')
+        info = (output / 'BUILD-INFO.txt').read_text()
+        self.assertIn(f'VERSION={version}\n', info)
+        self.assertIn(f'BASE_IMAGE_TAG=alpine:{alpine}\n', info)
+        self.assertIn('BASE_IMAGE_DIGEST=sha256:' + 'a' * 64, info)
+        self.assertIn('BASE_PLATFORM=linux/amd64\n', info)
+        self.assertEqual((output / 'APK-PACKAGES.txt').read_text(),
+                         'musl-1.2.5-r0\nopenssl-3.3.0-r0\n')
+        self.assertIn(['cp', 'test-container:/out/APK-PACKAGES.txt',
+                       str(output / 'APK-PACKAGES.txt')], self.calls)
+        self.assertTrue((output / 'SHA256SUMS').is_file())
+        verified = subprocess.run(['sha256sum', '-c', 'SHA256SUMS'], cwd=output,
+                                  capture_output=True, text=True)
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
         runtime_calls = [call for call in self.calls if str(call[0]).endswith('python3')]
         if runtime:
             self.assertEqual(runtime_calls, [self.calls[-1]])
@@ -188,7 +215,7 @@ class BuildTests(unittest.TestCase):
                 output = self.assert_build('openssh', version, alpine, '--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
                 names = client + extra
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', f'test-container:/out/{name}', str(output / name)]
                     for name in names
                 ])
@@ -208,7 +235,7 @@ class BuildTests(unittest.TestCase):
                 self.run_build(*args)
                 output = self.assert_build('curl', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', 'test-container:/out/curl', str(output / 'curl')],
                 ])
                 self.assertTrue((output / 'curl').is_file())
@@ -226,7 +253,7 @@ class BuildTests(unittest.TestCase):
                 self.run_build(*args)
                 output = self.assert_build('wget', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', 'test-container:/out/wget', str(output / 'wget')],
                 ])
                 self.assertTrue((output / 'wget').is_file())
@@ -244,7 +271,7 @@ class BuildTests(unittest.TestCase):
                 self.run_build(*args)
                 output = self.assert_build('rsync', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', 'test-container:/out/rsync', str(output / 'rsync')],
                 ])
                 self.assertTrue((output / 'rsync').is_file())
@@ -262,7 +289,7 @@ class BuildTests(unittest.TestCase):
                 self.run_build(*args)
                 output = self.assert_build('openssl', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', 'test-container:/out/openssl', str(output / 'openssl')],
                 ])
                 self.assertTrue((output / 'openssl').is_file())
@@ -291,7 +318,7 @@ class BuildTests(unittest.TestCase):
                 output = self.assert_build('git', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
                 self.assertEqual(
-                    [call for call in self.calls if call[0] == 'cp'],
+                    self.artifact_copies(),
                     [['cp', f'test-container:/out/{name}', str(output / name)]
                      for name in names])
                 recipe = (output / 'Dockerfile').read_text()
@@ -315,7 +342,7 @@ class BuildTests(unittest.TestCase):
                 self.run_build(*args)
                 output = self.assert_build('apache', version, clean='--clean' in args)
                 self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                self.assertEqual(self.artifact_copies(), [
                     ['cp', 'test-container:/out/httpd', str(output / 'httpd')],
                     ['cp', 'test-container:/out/httpd-prefork', str(output / 'httpd-prefork')],
                     ['cp', 'test-container:/out/htpasswd', str(output / 'htpasswd')],
@@ -343,7 +370,7 @@ class BuildTests(unittest.TestCase):
                     self.run_build(*args)
                     output = self.assert_build(target, version, clean='--clean' in args)
                     self.assertFalse(any(call[0] == 'run' for call in self.calls))
-                    self.assertEqual([call for call in self.calls if call[0] == 'cp'], [
+                    self.assertEqual(self.artifact_copies(), [
                         ['cp', f'test-container:/out/{target}', str(output / target)],
                     ])
                     self.assertTrue((output / target).is_file())
@@ -374,7 +401,8 @@ class BuildTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 directory = self.root / ('bin-' + '-'.join(names))
                 directory.mkdir()
-                for required in ('bash', 'dirname', 'mkdir', 'cat'):
+                for required in ('bash', 'dirname', 'mkdir', 'cat',
+                                 'rm', 'date', 'sha256sum'):
                     (directory / required).symlink_to(shutil.which(required))
                 for name in names:
                     tool = directory / name
@@ -403,6 +431,7 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn('static build OK', result.stdout)
         self.assertTrue(any(str(call[0]).endswith('python3') for call in self.calls))
         self.assertEqual((self.cwd / 'dist' / 'wget' / 'VERSION').read_text(), '1.25.0\n')
+        self.assertFalse((self.cwd / 'dist' / 'wget' / 'BUILD-INFO.txt').exists())
 
     def test_missing_target_shows_help(self):
         self.add_example_target('SHORTHAND_PATTERN="$VERSION_PATTERN"\n')
@@ -458,9 +487,11 @@ class BuildTests(unittest.TestCase):
 
     def test_docker_failure_and_cleanup(self):
         for action, expected in (
-            ('build', ['build']),
-            ('create', ['build', 'create']),
-            ('cp', ['build', 'create', 'cp', 'rm']),
+            ('pull', ['pull']),
+            ('image', ['pull', 'image']),
+            ('build', ['pull', 'image', 'image', 'build']),
+            ('create', ['pull', 'image', 'image', 'build', 'create']),
+            ('cp', ['pull', 'image', 'image', 'build', 'create', 'cp', 'rm']),
         ):
             with self.subTest(action=action):
                 self.run_build('php', '8.5.11', success=False, DOCKER_FAIL=action)
@@ -530,6 +561,9 @@ else
 fi
 ''')
         file_tool.chmod(0o755)
+        apk_tool = self.bin / 'apk'
+        apk_tool.write_text('#!/bin/sh\necho musl-1.2.5-r0\n')
+        apk_tool.chmod(0o755)
         for dynamic in ('', 'sapi/cli/php', 'sapi/cgi/php-cgi', 'sapi/fpm/php-fpm'):
             with self.subTest(dynamic=dynamic):
                 out = workspace / 'out'

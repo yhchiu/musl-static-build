@@ -79,7 +79,8 @@ Notes:
   - --clean passes --no-cache to Docker and may appear anywhere
   - --no-test skips artifact checks and may appear anywhere
   - Artifact checks need python3 and pytest; if either is missing, the build skips them and says so
-  - A build records its version in dist/<target>/VERSION
+  - Every build refreshes and pins its Alpine base image digest
+  - Build metadata: VERSION, BUILD-INFO.txt, APK-PACKAGES.txt, SHA256SUMS
   - Every exported binary must be statically linked
 USAGE
 }
@@ -169,7 +170,8 @@ write_dockerfile() {
         printf ' && %s\n' '\'
         printf "    cp '%s' '/out/%s'" "$source" "$destination"
     done
-    printf '\n'
+    printf ' && %s\n' '\'
+    printf '    apk info -v > /out/APK-PACKAGES.txt\n'
 }
 
 build_target() (
@@ -177,6 +179,9 @@ build_target() (
     local output_dir="$(pwd)/dist/$TARGET"
     local image="$TARGET-static-builder"
     local container_id="" artifact destination
+    local base_tag base_repo_digest base_digest base_ref base_platform
+    local git_commit="unknown" git_dirty="unknown" build_no_cache=false
+    local checksum_files=()
     cleanup() {
         if [ -n "$container_id" ]; then
             docker rm "$container_id" >/dev/null || true
@@ -192,10 +197,31 @@ build_target() (
 
     echo "[progress] Build $TARGET_DESCRIPTION $VERSION (Alpine $ALPINE_VERSION)..."
     mkdir -p "$output_dir"
+    # A failed rebuild must not leave metadata from a previous successful build.
+    rm -f -- "$output_dir/VERSION" "$output_dir/BUILD-INFO.txt" \
+        "$output_dir/APK-PACKAGES.txt" "$output_dir/SHA256SUMS"
+
+    # Resolve after target_prepare, which can change ALPINE_VERSION (OpenSSH 8.x).
+    # Pin the base image used by Docker, not merely the one reported in metadata.
+    base_tag="alpine:${ALPINE_VERSION}"
+    echo "[progress] Pull $base_tag..."
+    docker pull "$base_tag"
+    base_repo_digest=$(docker image inspect \
+        --format '{{index .RepoDigests 0}}' "$base_tag")
+    [[ "$base_repo_digest" =~ ^(alpine|docker\.io/library/alpine)@sha256:[a-f0-9]{64}$ ]] ||
+        fail "cannot resolve Alpine image digest: $base_repo_digest"
+    base_digest="${base_repo_digest##*@}"
+    base_ref="${base_tag}@${base_digest}"
+    base_platform=$(docker image inspect \
+        --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}' "$base_tag")
+    [[ "$base_platform" =~ ^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$ ]] ||
+        fail "cannot resolve Alpine image platform: $base_platform"
+
     write_dockerfile > "$output_dir/Dockerfile"
     docker build "${BUILD_OPTIONS[@]}" \
+        --platform "$base_platform" \
         --build-arg "VERSION=$VERSION" \
-        --build-arg "ALPINE_VERSION=$ALPINE_VERSION" \
+        --build-arg "ALPINE_VERSION=${ALPINE_VERSION}@${base_digest}" \
         -t "$image" -f "$output_dir/Dockerfile" "$TARGET_DIR"
 
     echo "[progress] Extract $TARGET_DESCRIPTION binaries..."
@@ -203,7 +229,9 @@ build_target() (
     for artifact in "${ARTIFACTS[@]}"; do
         destination="${artifact#*:}"
         docker cp "$container_id:/out/$destination" "$output_dir/$destination"
+        checksum_files+=("$destination")
     done
+    docker cp "$container_id:/out/APK-PACKAGES.txt" "$output_dir/APK-PACKAGES.txt"
     docker rm "$container_id" >/dev/null
     container_id=""
     printf '%s\n' "$VERSION" > "$output_dir/VERSION"
@@ -225,6 +253,33 @@ build_target() (
             )
         fi
     fi
+    # Include the provenance only after artifact checks pass.
+    if command -v git >/dev/null 2>&1 &&
+        git -C "$PROJECT_ROOT" rev-parse --verify HEAD >/dev/null 2>&1; then
+        git_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD)
+        if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ]; then
+            git_dirty=true
+        else
+            git_dirty=false
+        fi
+    fi
+    if [ "${#BUILD_OPTIONS[@]}" -gt 0 ]; then
+        build_no_cache=true
+    fi
+    {
+        printf 'TARGET=%s\n' "$TARGET"
+        printf 'VERSION=%s\n' "$VERSION"
+        printf 'BUILD_TIME_UTC=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'GIT_COMMIT=%s\n' "$git_commit"
+        printf 'GIT_DIRTY=%s\n' "$git_dirty"
+        printf 'BASE_IMAGE_TAG=%s\n' "$base_tag"
+        printf 'BASE_IMAGE_REF=%s\n' "$base_ref"
+        printf 'BASE_IMAGE_REPO_DIGEST=%s\n' "$base_repo_digest"
+        printf 'BASE_IMAGE_DIGEST=%s\n' "$base_digest"
+        printf 'BASE_PLATFORM=%s\n' "$base_platform"
+        printf 'BUILD_NO_CACHE=%s\n' "$build_no_cache"
+    } > "$output_dir/BUILD-INFO.txt"
+    (cd "$output_dir" && sha256sum -- "${checksum_files[@]}" > SHA256SUMS)
     echo "$TARGET_DESCRIPTION $VERSION static build OK: $output_dir"
 )
 
